@@ -1,0 +1,27 @@
+includes:
+- configs_wip/is2re/all/base.yml
+
+model:
+  name: dimenetplusplus
+  hidden_channels: 256
+  out_emb_channels: 192
+  num_blocks: 3
+  cutoff: 6.0
+  num_radial: 6
+  num_spherical: 7
+  num_before_skip: 1
+  num_after_skip: 2
+  num_output_layers: 3
+  regress_forces: False
+  use_pbc: True
+
+optim:
+  batch_size: 16  # old 4
+  eval_batch_size: 16
+  num_workers: 64
+  lr_initial: 0.0001
+  max_lr: 0.0001
+  max_epochs: 20
+  epochs: 20
+  scheduler: OneCycleLR
+  steps_per_epoch: 28771

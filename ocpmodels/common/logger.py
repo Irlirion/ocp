@@ -8,9 +8,9 @@ import logging
 from abc import ABC, abstractmethod
 
 import torch
-import wandb
 from torch.utils.tensorboard import SummaryWriter
 
+import wandb
 from ocpmodels.common.registry import registry
 
 

@@ -1,0 +1,31 @@
+includes:
+- configs_wip/is2re/10k/base.yml
+
+
+model:
+  name: dimenetplusplus_mish
+  cutoff: 6.0
+  hidden_channels: 256
+  num_after_skip: 2
+  num_before_skip: 1
+  num_blocks: 3
+  num_output_layers: 3
+  num_radial: 6
+  num_spherical: 7
+  otf_graph: false
+  out_emb_channels: 256
+  regress_forces: false
+  use_pbc: true
+
+optim:
+  batch_size: 32
+  ema_decay: 0.999
+  epochs: 25
+  eval_batch_size: 32
+  lr_initial: 0.0005
+  max_epochs: 25
+  max_lr: 0.0005
+  num_workers: 64
+  scheduler: OneCycleLR
+  steps_per_epoch: 313
+  weight_decay: 0.01

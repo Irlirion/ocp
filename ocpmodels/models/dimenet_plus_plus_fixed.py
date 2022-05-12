@@ -353,7 +353,7 @@ class DimeNetPlusPlus(torch.nn.Module):
         raise NotImplementedError
 
 
-@registry.register_model("dimenetplusplus")
+@registry.register_model("dimenetplusplus_fixed")
 class DimeNetPlusPlusWrap(DimeNetPlusPlus):
     def __init__(
         self,
@@ -456,7 +456,7 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
         angle = torch.atan2(b, a)
 
         rbf = self.rbf(dist)
-        sbf = self.sbf(dist, angle, idx_kj)
+        sbf = self.sbf(dist, angle, idx_ji)  # old pos_kj
 
         # Embedding block.
         x = self.emb(data.atomic_numbers.long(), rbf, i, j)

@@ -8,7 +8,6 @@ LICENSE file in the root directory of this source tree.
 import numpy as np
 import torch
 
-
 """
 An evaluation module for use with the OCP dataset and suite of tasks. It should
 be possible to import this independently of the rest of the codebase, e.g:

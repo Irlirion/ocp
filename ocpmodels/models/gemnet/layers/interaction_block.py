@@ -11,9 +11,7 @@ import torch
 
 from .atom_update_block import AtomUpdateBlock
 from .base_layers import Dense, ResidualLayer
-from .efficient import (
-    EfficientInteractionBilinear,
-)
+from .efficient import EfficientInteractionBilinear
 from .embedding_block import EdgeEmbedding
 from .scaling import ScalingFactor
 
