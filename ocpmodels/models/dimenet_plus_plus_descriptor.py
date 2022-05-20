@@ -1,4 +1,4 @@
-import math
+from math import sqrt
 
 import torch
 from torch import nn
@@ -53,6 +53,7 @@ class InteractionPPBlock(torch.nn.Module):
         basis_emb_size,
         num_spherical,
         num_radial,
+        num_radial_desc,
         num_before_skip,
         num_after_skip,
         act=swish,
@@ -63,6 +64,12 @@ class InteractionPPBlock(torch.nn.Module):
         # Transformations of Bessel and spherical basis representations.
         self.lin_rbf1 = nn.Linear(num_radial, basis_emb_size, bias=False)
         self.lin_rbf2 = nn.Linear(basis_emb_size, hidden_channels, bias=False)
+        self.lin_rbf_desc1 = nn.Linear(
+            num_radial_desc, basis_emb_size, bias=False
+        )
+        self.lin_rbf_desc2 = nn.Linear(
+            basis_emb_size, hidden_channels, bias=False
+        )
         self.lin_sbf1 = nn.Linear(
             num_spherical * num_radial, basis_emb_size, bias=False
         )
@@ -96,6 +103,8 @@ class InteractionPPBlock(torch.nn.Module):
     def reset_parameters(self):
         glorot_orthogonal(self.lin_rbf1.weight, scale=2.0)
         glorot_orthogonal(self.lin_rbf2.weight, scale=2.0)
+        glorot_orthogonal(self.lin_rbf_desc1.weight, scale=2.0)
+        glorot_orthogonal(self.lin_rbf_desc2.weight, scale=2.0)
         glorot_orthogonal(self.lin_sbf1.weight, scale=2.0)
         glorot_orthogonal(self.lin_sbf2.weight, scale=2.0)
 
@@ -114,7 +123,7 @@ class InteractionPPBlock(torch.nn.Module):
         for res_layer in self.layers_after_skip:
             res_layer.reset_parameters()
 
-    def forward(self, x, rbf, sbf, idx_kj, idx_ji):
+    def forward(self, x, rbf, rbf_desc, sbf, idx_kj, idx_ji):
         # Initial transformations.
         x_ji = self.act(self.lin_ji(x))
         x_kj = self.act(self.lin_kj(x))
@@ -122,7 +131,9 @@ class InteractionPPBlock(torch.nn.Module):
         # Transformation via Bessel basis.
         rbf = self.lin_rbf1(rbf)
         rbf = self.lin_rbf2(rbf)
-        x_kj = x_kj * rbf
+        rbf_desc = self.lin_rbf_desc1(rbf_desc)
+        rbf_desc = self.lin_rbf_desc2(rbf_desc)
+        x_kj = x_kj * rbf * rbf_desc
 
         # Down-project embeddings and generate interaction triplet embeddings.
         x_kj = self.act(self.lin_down(x_kj))
@@ -150,6 +161,7 @@ class OutputPPBlock(torch.nn.Module):
     def __init__(
         self,
         num_radial,
+        num_radial_desc,
         hidden_channels,
         out_emb_channels,
         out_channels,
@@ -160,6 +172,9 @@ class OutputPPBlock(torch.nn.Module):
         self.act = act
 
         self.lin_rbf = nn.Linear(num_radial, hidden_channels, bias=False)
+        self.lin_rbf_desc = nn.Linear(
+            num_radial_desc, hidden_channels, bias=False
+        )
         self.lin_up = nn.Linear(hidden_channels, out_emb_channels, bias=True)
         self.lins = torch.nn.ModuleList()
         for _ in range(num_layers):
@@ -170,14 +185,15 @@ class OutputPPBlock(torch.nn.Module):
 
     def reset_parameters(self):
         glorot_orthogonal(self.lin_rbf.weight, scale=2.0)
+        glorot_orthogonal(self.lin_rbf_desc.weight, scale=2.0)
         glorot_orthogonal(self.lin_up.weight, scale=2.0)
         for lin in self.lins:
             glorot_orthogonal(lin.weight, scale=2.0)
             lin.bias.data.fill_(0)
         self.lin.weight.data.fill_(0)
 
-    def forward(self, x, rbf, i, num_nodes=None):
-        x = self.lin_rbf(rbf) * x
+    def forward(self, x, rbf, rbf_desc, i, num_nodes=None):
+        x = self.lin_rbf(rbf) * self.lin_rbf_desc(rbf_desc) * x
         x = scatter(x, i, dim=0, dim_size=num_nodes)
         x = self.lin_up(x)
         for lin in self.lins:
@@ -185,26 +201,34 @@ class OutputPPBlock(torch.nn.Module):
         return self.lin(x)
 
 
-class EmbeddingBlock(nn.Module):
-    def __init__(self, num_radial, hidden_channels, act=swish):
+class EmbeddingBlock(torch.nn.Module):
+    def __init__(
+        self, num_radial, num_radial_desc, hidden_channels, act=swish
+    ):
         super(EmbeddingBlock, self).__init__()
         self.act = act
 
         self.embedding = nn.Embedding(95, hidden_channels)
         self.lin_rbf = nn.Linear(num_radial, hidden_channels)
-        self.lin = nn.Linear(3 * hidden_channels, hidden_channels)
+        self.lin_rbf_desc = nn.Linear(num_radial_desc, hidden_channels)
+        self.lin = nn.Linear(4 * hidden_channels, hidden_channels)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.embedding.weight.data.uniform_(-math.sqrt(3), math.sqrt(3))
+        self.embedding.weight.data.uniform_(-sqrt(3), sqrt(3))
         self.lin_rbf.reset_parameters()
+        self.lin_rbf_desc.reset_parameters()
         self.lin.reset_parameters()
 
-    def forward(self, x, rbf, i, j):
+    def forward(self, x, rbf, rbf_desc, i, j):
         x = self.embedding(x)
         rbf = self.act(self.lin_rbf(rbf))
-        return self.act(self.lin(torch.cat([x[i], x[j], rbf], dim=-1)))
+        rbf_desc = self.act(self.lin_rbf_desc(rbf_desc))
+
+        return self.act(
+            self.lin(torch.cat([x[i], x[j], rbf, rbf_desc], dim=-1))
+        )
 
 
 class DimeNetPlusPlus(torch.nn.Module):
@@ -251,6 +275,8 @@ class DimeNetPlusPlus(torch.nn.Module):
         num_after_skip=2,
         num_output_layers=3,
         act=swish,
+        cutoff_desc=None,
+        num_radial_desc=None,
     ):
         super(DimeNetPlusPlus, self).__init__()
 
@@ -262,16 +288,23 @@ class DimeNetPlusPlus(torch.nn.Module):
         self.num_blocks = num_blocks
 
         self.rbf = BesselBasisLayer(num_radial, cutoff, envelope_exponent)
+        self.rbf_desc = BesselBasisLayer(
+            num_radial_desc, cutoff_desc, envelope_exponent
+        )
+
         self.sbf = SphericalBasisLayer(
             num_spherical, num_radial, cutoff, envelope_exponent
         )
 
-        self.emb = EmbeddingBlock(num_radial, hidden_channels, act)
+        self.emb = EmbeddingBlock(
+            num_radial, num_radial_desc, hidden_channels, act
+        )
 
         self.output_blocks = torch.nn.ModuleList(
             [
                 OutputPPBlock(
                     num_radial,
+                    num_radial_desc,
                     hidden_channels,
                     out_emb_channels,
                     out_channels,
@@ -290,6 +323,7 @@ class DimeNetPlusPlus(torch.nn.Module):
                     basis_emb_size,
                     num_spherical,
                     num_radial,
+                    num_radial_desc,
                     num_before_skip,
                     num_after_skip,
                     act,
@@ -301,8 +335,8 @@ class DimeNetPlusPlus(torch.nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.emb.reset_parameters()
         self.rbf.reset_parameters()
+        self.emb.reset_parameters()
         for out in self.output_blocks:
             out.reset_parameters()
         for interaction in self.interaction_blocks:
@@ -336,7 +370,7 @@ class DimeNetPlusPlus(torch.nn.Module):
         raise NotImplementedError
 
 
-@registry.register_model("dimenetplusplus_mish")
+@registry.register_model("dimenetplusplus_mish_desc2")
 class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
     def __init__(
         self,
@@ -358,12 +392,16 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
         num_before_skip=1,
         num_after_skip=2,
         num_output_layers=3,
+        cutoff_desc=None,
+        num_radial_desc=None,
+        descriptor_name=None,
     ):
         self.num_targets = num_targets
         self.regress_forces = regress_forces
         self.use_pbc = use_pbc
         self.cutoff = cutoff
         self.otf_graph = otf_graph
+        self.descriptor_name = descriptor_name
 
         super(DimeNetPlusPlusMishWrap, self).__init__(
             hidden_channels=hidden_channels,
@@ -380,6 +418,8 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
             num_after_skip=num_after_skip,
             num_output_layers=num_output_layers,
             act=torch.nn.Mish(),
+            cutoff_desc=cutoff_desc,
+            num_radial_desc=num_radial_desc,
         )
 
     @conditional_grad(torch.enable_grad())
@@ -408,16 +448,22 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
             edge_index = out["edge_index"]
             dist = out["distances"]
             offsets = out["offsets"]
-
+            data.edge_index = edge_index
+            data.distances = dist
             j, i = edge_index
         else:
-            edge_index = radius_graph(pos, r=self.cutoff, batch=batch)
+            data.edge_index = radius_graph(pos, r=self.cutoff, batch=batch)
             j, i = edge_index
-            dist = (pos[i] - pos[j]).pow(2).sum(dim=-1).sqrt()
+            data.distances = (pos[i] - pos[j]).pow(2).sum(dim=-1).sqrt()
 
         _, _, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
-            edge_index, num_nodes=data.atomic_numbers.size(0)
+            data.edge_index, num_nodes=data.atomic_numbers.size(0)
         )
+
+        descriptor_dense = getattr(data, self.descriptor_name).to_dense()
+        descriptor = descriptor_dense[
+            data.edge_index[0], data.edge_index[1]
+        ].type_as(data.pos)
 
         # Calculate angles.
         pos_i = pos[idx_i].detach()
@@ -437,19 +483,21 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
         b = torch.cross(pos_ji, pos_kj).norm(dim=-1)
         angle = torch.atan2(b, a)
 
-        rbf = self.rbf(dist)
-        sbf = self.sbf(dist, angle, idx_kj)
+        rbf = self.rbf(data.distances)
+        rbf_desc = self.rbf_desc(descriptor)
+
+        sbf = self.sbf(data.distances, angle, idx_ji)
 
         # Embedding block.
-        x = self.emb(data.atomic_numbers.long(), rbf, i, j)
-        P = self.output_blocks[0](x, rbf, i, num_nodes=pos.size(0))
+        x = self.emb(data.atomic_numbers.long(), rbf, rbf_desc, i, j)
+        P = self.output_blocks[0](x, rbf, rbf_desc, i, num_nodes=pos.size(0))
 
         # Interaction blocks.
         for interaction_block, output_block in zip(
             self.interaction_blocks, self.output_blocks[1:]
         ):
-            x = interaction_block(x, rbf, sbf, idx_kj, idx_ji)
-            P += output_block(x, rbf, i, num_nodes=pos.size(0))
+            x = interaction_block(x, rbf, rbf_desc, sbf, idx_kj, idx_ji)
+            P += output_block(x, rbf, rbf_desc, i, num_nodes=pos.size(0))
 
         energy = P.sum(dim=0) if batch is None else scatter(P, batch, dim=0)
 

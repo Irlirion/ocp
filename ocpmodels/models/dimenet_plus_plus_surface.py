@@ -1,3 +1,37 @@
+"""
+Copyright (c) Facebook, Inc. and its affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+
+---
+
+This code borrows heavily from the DimeNet implementation as part of
+pytorch-geometric: https://github.com/rusty1s/pytorch_geometric. License:
+
+---
+
+Copyright (c) 2020 Matthias Fey <matthias.fey@tu-dortmund.de>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+"""
+
 import math
 
 import torch
@@ -19,11 +53,47 @@ from ocpmodels.common.utils import (
     get_pbc_distances,
     radius_graph_pbc,
 )
+from ocpmodels.models.utils.surface import get_surf_bin_features
 
 try:
     import sympy as sym
 except ImportError:
     sym = None
+
+import pandas as pd
+
+
+class EmbeddingBlock(torch.nn.Module):
+    def __init__(self, num_radial, hidden_channels, act=swish):
+        super().__init__()
+        self.act = act
+
+        self.emb = nn.Embedding(95, hidden_channels // 2)
+        self.lin_rbf = nn.Linear(num_radial, hidden_channels)
+        self.lin_surface = nn.Linear(4, hidden_channels // 2)
+        self.lin_i = nn.Linear(hidden_channels, hidden_channels)
+        self.lin_j = nn.Linear(hidden_channels, hidden_channels)
+        self.lin_rbf2 = nn.Linear(hidden_channels, hidden_channels)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.emb.weight.data.uniform_(-math.sqrt(3), math.sqrt(3))
+        self.lin_rbf.reset_parameters()
+        self.lin_surface.reset_parameters()
+        self.lin_i.reset_parameters()
+        self.lin_j.reset_parameters()
+        self.lin_rbf2.reset_parameters()
+
+    def forward(self, x, rbf, i, j, node_bin_features):
+        x = torch.cat(
+            [self.emb(x), self.lin_surface(node_bin_features)], dim=-1
+        )
+        rbf = self.act(self.lin_rbf(rbf))
+        x_i = self.lin_i(x[i])
+        x_j = self.lin_j(x[j])
+        rbf = self.lin_rbf2(rbf)
+        return self.act(x_i + x_j + rbf)
 
 
 class BesselBasisLayer(torch.nn.Module):
@@ -185,28 +255,6 @@ class OutputPPBlock(torch.nn.Module):
         return self.lin(x)
 
 
-class EmbeddingBlock(nn.Module):
-    def __init__(self, num_radial, hidden_channels, act=swish):
-        super(EmbeddingBlock, self).__init__()
-        self.act = act
-
-        self.embedding = nn.Embedding(95, hidden_channels)
-        self.lin_rbf = nn.Linear(num_radial, hidden_channels)
-        self.lin = nn.Linear(3 * hidden_channels, hidden_channels)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.embedding.weight.data.uniform_(-math.sqrt(3), math.sqrt(3))
-        self.lin_rbf.reset_parameters()
-        self.lin.reset_parameters()
-
-    def forward(self, x, rbf, i, j):
-        x = self.embedding(x)
-        rbf = self.act(self.lin_rbf(rbf))
-        return self.act(self.lin(torch.cat([x[i], x[j], rbf], dim=-1)))
-
-
 class DimeNetPlusPlus(torch.nn.Module):
     r"""DimeNet++ implementation based on https://github.com/klicperajo/dimenet.
 
@@ -301,14 +349,14 @@ class DimeNetPlusPlus(torch.nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.emb.reset_parameters()
         self.rbf.reset_parameters()
+        self.emb.reset_parameters()
         for out in self.output_blocks:
             out.reset_parameters()
         for interaction in self.interaction_blocks:
             interaction.reset_parameters()
 
-    def triplets(self, edge_index, num_nodes):
+    def triplets(self, edge_index, cell_offsets, num_nodes):
         row, col = edge_index  # j->i
 
         value = torch.arange(row.size(0), device=row.device)
@@ -322,27 +370,35 @@ class DimeNetPlusPlus(torch.nn.Module):
         idx_i = col.repeat_interleave(num_triplets)
         idx_j = row.repeat_interleave(num_triplets)
         idx_k = adj_t_row.storage.col()
-        mask = idx_i != idx_k  # Remove i == k triplets.
-        idx_i, idx_j, idx_k = idx_i[mask], idx_j[mask], idx_k[mask]
 
-        # Edge indices (k-j, j->i) for triplets.
-        idx_kj = adj_t_row.storage.value()[mask]
-        idx_ji = adj_t_row.storage.row()[mask]
+        # Edge indices (k->j, j->i) for triplets.
+        idx_kj = adj_t_row.storage.value()
+        idx_ji = adj_t_row.storage.row()
+
+        # Remove self-loop triplets d->b->d
+        # Check atom as well as cell offset
+        cell_offset_kji = cell_offsets[idx_kj] + cell_offsets[idx_ji]
+        mask = (idx_i != idx_k) | torch.any(cell_offset_kji != 0, dim=-1)
+
+        idx_i, idx_j, idx_k = idx_i[mask], idx_j[mask], idx_k[mask]
+        idx_kj, idx_ji = idx_kj[mask], idx_ji[mask]
 
         return col, row, idx_i, idx_j, idx_k, idx_kj, idx_ji
 
     def forward(self, z, pos, batch=None):
-        """"""
+        """ """
         raise NotImplementedError
 
 
-@registry.register_model("dimenetplusplus_mish")
-class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
+@registry.register_model("dimenetplusplus_surface")
+class DimeNetPlusPlusWrap(DimeNetPlusPlus):
     def __init__(
         self,
         num_atoms,
         bond_feat_dim,  # not used
         num_targets,
+        features_csv: str,
+        cov_coeff: int = 1.5,
         use_pbc=True,
         regress_forces=True,
         hidden_channels=128,
@@ -365,7 +421,12 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
         self.cutoff = cutoff
         self.otf_graph = otf_graph
 
-        super(DimeNetPlusPlusMishWrap, self).__init__(
+        self.cov_coeff = cov_coeff
+        features = pd.read_csv(features_csv)
+        self.cov_rad = features["Cov_radius_cordero"].values
+        self.adsorb_atomic_numbers = (1, 6, 7, 8)
+
+        super(DimeNetPlusPlusWrap, self).__init__(
             hidden_channels=hidden_channels,
             out_channels=num_targets,
             num_blocks=num_blocks,
@@ -379,7 +440,6 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
             num_before_skip=num_before_skip,
             num_after_skip=num_after_skip,
             num_output_layers=num_output_layers,
-            act=torch.nn.Mish(),
         )
 
     @conditional_grad(torch.enable_grad())
@@ -389,7 +449,7 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
 
         if self.otf_graph:
             edge_index, cell_offsets, neighbors = radius_graph_pbc(
-                data, self.cutoff, 50, data.pos.device
+                data, self.cutoff, 50
             )
             data.edge_index = edge_index
             data.cell_offsets = cell_offsets
@@ -416,7 +476,13 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
             dist = (pos[i] - pos[j]).pow(2).sum(dim=-1).sqrt()
 
         _, _, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
-            edge_index, num_nodes=data.atomic_numbers.size(0)
+            edge_index,
+            data.cell_offsets,
+            num_nodes=data.atomic_numbers.size(0),
+        )
+
+        node_bin_features = get_surf_bin_features(
+            data, self.cov_rad, self.adsorb_atomic_numbers, self.cov_coeff
         )
 
         # Calculate angles.
@@ -441,7 +507,7 @@ class DimeNetPlusPlusMishWrap(DimeNetPlusPlus):
         sbf = self.sbf(dist, angle, idx_kj)
 
         # Embedding block.
-        x = self.emb(data.atomic_numbers.long(), rbf, i, j)
+        x = self.emb(data.atomic_numbers.long(), rbf, i, j, node_bin_features)
         P = self.output_blocks[0](x, rbf, i, num_nodes=pos.size(0))
 
         # Interaction blocks.
